@@ -13,66 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-import shutil
-import datetime
 import cProfile
+import datetime
+import shutil
+import sys
 import traceback
-from pstats import Stats
-from pathlib import Path
-from functools import partial
 from argparse import ArgumentParser
+from functools import partial
+from pathlib import Path
+from pstats import Stats
 from tempfile import TemporaryDirectory
-from typing import Dict, Iterable, TextIO
-
-from pandas import DataFrame, date_range
+from typing import Dict, Iterable, List, TextIO
 
 from lib.concurrent import thread_map
-from lib.constants import SRC, EXCLUDE_FROM_MAIN_TABLE
-from lib.io import display_progress, export_csv, read_file, read_lines, pbar
+from lib.constants import EXCLUDE_FROM_MAIN_TABLE, OUTPUT_COLUMN_ADAPTER, SRC
+from lib.io import display_progress, pbar, read_lines
 from lib.memory_efficient import (
-    get_table_columns,
-    table_join,
-    table_sort,
-    table_cross_product,
-    table_group_tail,
     convert_csv_to_json_records,
+    get_table_columns,
+    table_breakout,
+    table_cross_product,
+    table_drop_nan_columns,
+    table_group_tail,
+    table_join,
+    table_read_column,
+    table_rename,
+    table_sort,
 )
 from lib.pipeline_tools import get_schema
-
-
-def _read_main_table(path: Path) -> DataFrame:
-    return read_file(
-        path,
-        dtype={
-            "country_code": "category",
-            "country_name": "category",
-            "subregion1_code": "category",
-            "subregion1_name": "category",
-            "subregion2_code": "category",
-            "subregion2_name": "category",
-            "3166-1-alpha-2": "category",
-            "3166-1-alpha-3": "category",
-            "aggregation_level": "category",
-        },
-    )
-
-
-def _subset_last_days(output_folder: Path, days: int) -> None:
-    """ Outputs last N days of data """
-    n_days_folder = output_folder / str(days)
-    n_days_folder.mkdir(exist_ok=True)
-    for csv_file in (output_folder).glob("*.csv"):
-        table = read_file(csv_file)
-
-        # Degenerate case: this table has no date
-        if not "date" in table.columns or len(table.date.dropna()) == 0:
-            export_csv(table, n_days_folder / csv_file.name)
-        else:
-            last_date = datetime.date.fromisoformat(max(table.date))
-            # Since APAC is almost always +1 days ahead, increase the window by 1
-            first_date = last_date - datetime.timedelta(days=days + 1)
-            export_csv(table[table.date >= first_date.isoformat()], n_days_folder / csv_file.name)
+from lib.sql import create_sqlite_database, table_as_csv, table_import_from_file, table_merge
+from lib.time import date_range
 
 
 def _subset_grouped_key(
@@ -135,70 +105,183 @@ def copy_tables(tables_folder: Path, public_folder: Path) -> None:
         shutil.copy(output_file, public_folder / output_file.name)
 
 
-def make_main_table(tables_folder: Path, output_path: Path) -> None:
+def _make_key_and_date_table(
+    index_path: Path, output_path: Path, location_key: str = "key"
+) -> None:
+    # Use a temporary directory for intermediate files
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+
+        # Create a single-column table with only the keys
+        keys_table_path = workdir / "keys.csv"
+        with open(keys_table_path, "w") as fd:
+            fd.write(f"{location_key}\n")
+            fd.writelines(f"{value}\n" for value in table_read_column(index_path, location_key))
+
+        # Add a date to each region from index to allow iterative left joins
+        max_date = (datetime.datetime.now() + datetime.timedelta(days=1)).date().isoformat()
+        date_table_path = workdir / "dates.csv"
+        with open(date_table_path, "w") as fd:
+            fd.write("date\n")
+            fd.writelines(f"{value}\n" for value in date_range("2020-01-01", max_date))
+
+        # Output all combinations of <key x date>
+        table_cross_product(keys_table_path, date_table_path, output_path)
+
+
+def make_main_table_v3(
+    tables_folder: Path,
+    output_path: Path,
+    location_key: str = "key",
+    exclude_tables: List[str] = None,
+    drop_empty_columns: bool = False,
+) -> None:
     """
     Build a flat view of all tables combined, joined by <key> or <key, date>.
-
     Arguments:
-        tables_folder: Input folder where all CSV files exist.
-    Returns:
-        DataFrame: Flat table with all data combined.
+        tables_folder: Input directory where all CSV files exist.
+        output_path: Output directory for the resulting main.csv file.
+        location_key: Name of the key to use for the location, "key" (v2) or "location_key" (v3)
+        include_all: Flag indicating if tables from EXCLUDE_FROM_MAIN_TABLE should be excluded.
     """
+    # Tables excluded default to a known set
+    if exclude_tables is None:
+        exclude_tables = set(EXCLUDE_FROM_MAIN_TABLE)
 
     # Use a temporary directory for intermediate files
     with TemporaryDirectory() as workdir:
         workdir = Path(workdir)
 
-        # Merge all output files into a single table
-        keys_table_path = workdir / "keys.csv"
-        keys_table = read_file(tables_folder / "index.csv", usecols=["key"])
-        export_csv(keys_table, keys_table_path)
-        print("Created keys table")
+        # Use temporary files to avoid computing everything in memory
+        temp_input = workdir / "tmp.1.csv"
+        temp_output = workdir / "tmp.2.csv"
 
-        # Add a date to each region from index to allow iterative left joins
-        max_date = (datetime.datetime.now() + datetime.timedelta(days=1)).date().isoformat()
-        date_list = [date.date().isoformat() for date in date_range("2020-01-01", max_date)]
-        date_table_path = workdir / "dates.csv"
-        export_csv(DataFrame(date_list, columns=["date"]), date_table_path)
-        print("Created dates table")
+        # Start with all combinations of <key x date>
+        index_table = tables_folder / "index.csv"
+        _make_key_and_date_table(index_table, temp_output, location_key=location_key)
+        temp_input, temp_output = temp_output, temp_input
 
-        # Create a temporary working table file which can be used during the steps
-        temp_file_path = workdir / "main.tmp.csv"
-        table_cross_product(keys_table_path, date_table_path, temp_file_path)
-        print("Created cross product table")
-
-        # Add all the index columns to seed the main table
-        main_table_path = workdir / "main.csv"
-        table_join(
-            temp_file_path, tables_folder / "index.csv", ["key"], main_table_path, how="outer"
-        )
-        print("Joined with table index")
-
-        non_dated_columns = set(get_table_columns(main_table_path))
-        for table_file_path in pbar([*tables_folder.glob("*.csv")], desc="Make main table"):
+        non_dated_columns = set(get_table_columns(temp_input))
+        for table_file_path in tables_folder.glob("*.csv"):
             table_name = table_file_path.stem
-            if table_name not in EXCLUDE_FROM_MAIN_TABLE:
 
-                table_columns = get_table_columns(table_file_path)
-                if "date" in table_columns:
-                    join_on = ["key", "date"]
-                else:
-                    join_on = ["key"]
+            # Procede depending on whether this table should be excluded
+            if table_name in exclude_tables:
+                continue
 
-                    # Keep track of columns which are not indexed by date
-                    non_dated_columns = non_dated_columns | set(table_columns)
+            table_columns = get_table_columns(table_file_path)
+            if "date" in table_columns:
+                join_on = [location_key, "date"]
+            else:
+                join_on = [location_key]
 
-                # Iteratively perform left outer joins on all tables
-                table_join(main_table_path, table_file_path, join_on, temp_file_path, how="outer")
-                shutil.move(temp_file_path, main_table_path)
-                print(f"Joined with table {table_name}")
+                # Keep track of columns which are not indexed by date
+                non_dated_columns = non_dated_columns | set(table_columns)
+
+            # Iteratively perform left outer joins on all tables
+            table_join(temp_input, table_file_path, join_on, temp_output)
+
+            # Flip-flop the temp files to avoid a copy
+            temp_input, temp_output = temp_output, temp_input
 
         # Drop rows with null date or without a single dated record
         # TODO: figure out a memory-efficient way to do this
 
-        # Ensure that the table is appropriately sorted ans write to output location
-        table_sort(main_table_path, output_path)
-        print("Sorted main table")
+        # Remove columns which provide no data because they are only null values
+        if drop_empty_columns:
+            table_drop_nan_columns(temp_input, temp_output)
+            temp_input, temp_output = temp_output, temp_input
+
+        # Ensure that the table is appropriately sorted and write to output location
+        table_sort(temp_input, output_path)
+
+
+def make_main_table_sqlite(
+    tables_folder: Path,
+    output_path: Path,
+    location_key: str = "key",
+    exclude_tables: List[str] = None,
+    drop_empty_columns: bool = False,
+) -> None:
+    """
+    Build a flat view of all tables combined, joined by <key> or <key, date>.
+
+    Arguments:
+        tables_folder: Input directory where all CSV files exist.
+        output_path: Output directory for the resulting main.csv file.
+        location_key: Name of the key to use for the location, "key" (v2) or "location_key" (v3).
+        exclude_tables: List of tables that should be excluded from the joint output.
+        drop_empty_columns: Flag indicating whether columns with no data should be dropped.
+    """
+    # Tables excluded default to a known set
+    if exclude_tables is None:
+        exclude_tables = set(EXCLUDE_FROM_MAIN_TABLE)
+
+    # Use a temporary directory for intermediate files
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+
+        # Start with all combinations of <key x date>
+        index_table = tables_folder / "index.csv"
+        cross_product_table_path = workdir / "cross-product.csv"
+        _make_key_and_date_table(index_table, cross_product_table_path, location_key=location_key)
+
+        # Import all tables into a temporary database, default to using in-memory db
+        with create_sqlite_database() as conn:
+
+            cross_product_schema = {location_key: str, "date": str}
+            table_import_from_file(conn, cross_product_table_path, schema=cross_product_schema)
+
+            # Get a list of all tables which are indexed by <key> or by <key, date>
+            schema = get_schema()
+            idx1 = []
+            idx2 = [cross_product_table_path.stem]
+            for table_file_path in tables_folder.glob("*.csv"):
+                table_name = table_file_path.stem
+                table_columns = get_table_columns(table_file_path)
+                table_schema = {col: schema.get(col, str) for col in table_columns}
+                table_import_from_file(
+                    conn, table_file_path, table_name=table_name, schema=table_schema
+                )
+                if "date" in table_columns:
+                    idx2.append(table_name)
+                else:
+                    idx1.append(table_name)
+
+            # More readable variable name
+            key = location_key
+
+            # All joins are LEFT OUTER JOIN
+            join_method = "LEFT OUTER"
+
+            # Perform the join in 3 steps, first join all tables by key
+            table_merge(conn, idx1, on=[key], how=join_method, into_table="_idx1")
+
+            # Next, join all the tables by <key, date>
+            table_merge(conn, idx2, on=[key, "date"], how=join_method, into_table="_idx2")
+
+            # Finally join the two sets of tables together
+            # NOTE: order of tables merged matters, since SQLite only supports *LEFT* OUTER joins
+            table_merge(conn, ["_idx2", "_idx1"], on=[key], how=join_method, into_table="_main")
+
+            # TODO: avoid use of temporary files for this
+            temp_input = workdir / "tmp.1.csv"
+            temp_output = workdir / "tmp.2.csv"
+
+            # Dump the table as a CSV file
+            table_as_csv(conn, "_main", temp_output, sort_by=[key, "date"])
+            temp_input, temp_output = temp_output, temp_input
+
+            # Drop rows with null date or without a single dated record
+            # TODO: figure out a memory-efficient way to do this
+
+            # Remove columns which provide no data because they are only null values
+            if drop_empty_columns:
+                table_drop_nan_columns(temp_input, temp_output)
+                temp_input, temp_output = temp_output, temp_input
+
+            # Write to output location
+            shutil.copy(temp_input, output_path)
 
 
 def create_table_subsets(main_table_path: Path, output_path: Path) -> Iterable[Path]:
@@ -244,7 +327,111 @@ def convert_tables_to_json(csv_folder: Path, output_folder: Path) -> Iterable[Pa
             yield json_output
 
 
-def main(output_folder: Path, tables_folder: Path, show_progress: bool = True) -> None:
+def publish_location_breakouts(tables_folder: Path, output_folder: Path) -> None:
+    """
+    Breaks out each of the tables in `tables_folder` based on location key, and writes them into
+    subdirectories of `output_folder`. This method also joins *all* the tables into a main.csv
+    table, which will be more comprehensive than the global main.csv.
+
+    Arguments:
+        tables_folder: Directory containing input CSV files.
+        output_folder: Output path for the resulting location data.
+    """
+    # Break out each table into separate folders based on the location key
+    for csv_path in tables_folder.glob("*.csv"):
+        print(f"Breaking out table {csv_path.name}")
+        table_breakout(csv_path, output_folder, "location_key")
+
+
+def publish_location_aggregates(
+    tables_folder: Path, output_folder: Path, location_keys: Iterable[str]
+) -> None:
+    """
+    This method joins *all* the tables for each location into a main.csv table.
+
+    Arguments:
+        tables_folder: Directory containing input CSV files.
+        output_folder: Output path for the resulting location data.
+        location_keys: List of location keys to do aggregation for.
+    """
+    # Create a main.csv file for each of the locations in parallel
+    map_func = lambda key: make_main_table_v3(
+        tables_folder / key,
+        output_folder / key / "main.csv",
+        location_key="location_key",
+        exclude_tables=["main"],
+        drop_empty_columns=True,
+    )
+    list(thread_map(map_func, list(location_keys), desc="Creating location subsets"))
+
+
+def publish_global_tables(tables_folder: Path, output_folder: Path) -> None:
+    """
+    Copy all the tables from `tables_folder` into `output_folder` converting the column names to the
+    latest schema, and join all the tables into a single main.csv file.
+
+    Arguments:
+        tables_folder: Input directory containing tables as CSV files.
+        output_folder: Directory where the output tables will be written.
+    """
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+
+        for csv_path in tables_folder.glob("*.csv"):
+            # Copy all output files to a temporary folder, renaming columns if necessary
+            print(f"Renaming columns for {csv_path.name}")
+            table_rename(csv_path, workdir / csv_path.name, OUTPUT_COLUMN_ADAPTER)
+
+        for csv_path in tables_folder.glob("*.csv"):
+            # Sort output files by location key, since the following breakout step requires it
+            print(f"Sorting {csv_path.name}")
+            table_sort(workdir / csv_path.name, output_folder / csv_path.name, ["location_key"])
+
+    # Main table is not created for the global output, because it's too big to be useful
+
+
+def main_v3(output_folder: Path, tables_folder: Path, show_progress: bool = True) -> None:
+    """
+    This script takes the processed outputs located in `tables_folder` and publishes them into the
+    output folder by performing the following operations:
+
+        1. Copy all the tables from `tables_folder` to `output_folder`, renaming fields if
+           necessary.
+        2. Create different slices of data, such as the latest known record for each region, files
+           for the last N days of data, files for each individual region.
+        3. Produce a main table, created by iteratively performing left outer joins on all other
+           tables for each slice of data (bot not for the global tables).
+    """
+    with display_progress(show_progress):
+
+        # Wipe the output folder first
+        for item in output_folder.glob("*"):
+            if item.name.startswith("."):
+                continue
+            if item.is_file():
+                item.unlink()
+            else:
+                shutil.rmtree(item)
+
+        # Create the folder which will be published using a stable schema
+        v3_folder = output_folder / "v3"
+        v3_folder.mkdir(exist_ok=True, parents=True)
+
+        # Publish the tables containing all location keys
+        publish_global_tables(tables_folder, v3_folder)
+
+        # Break out each table into separate folders based on the location key
+        publish_location_breakouts(v3_folder, v3_folder)
+
+        # Aggregate the independent tables for each location
+        location_keys = table_read_column(v3_folder / "index.csv", "location_key")
+        publish_location_aggregates(v3_folder, v3_folder, location_keys)
+
+        # Convert all CSV files to JSON using values format
+        # convert_tables_to_json([*v3_folder.glob("**/*.csv")], v3_folder)
+
+
+def main_v2(output_folder: Path, tables_folder: Path, show_progress: bool = True) -> None:
     """
     This script takes the processed outputs located in `tables_folder` and publishes them into the
     output folder by performing the following operations:
@@ -299,7 +486,8 @@ if __name__ == "__main__":
         profiler = cProfile.Profile()
         profiler.enable()
 
-    main(Path(args.output_folder), Path(args.tables_folder), show_progress=not args.no_progress)
+    main_v3(Path(args.output_folder), Path(args.tables_folder), show_progress=not args.no_progress)
+    # main_v2(Path(args.output_folder), Path(args.tables_folder), show_progress=not args.no_progress)
 
     if args.profile:
         stats = Stats(profiler)

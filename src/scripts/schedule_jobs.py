@@ -88,21 +88,21 @@ def schedule_all_jobs(project_id: str, location_id: str, time_zone: str) -> None
 
     # The job that publishes data into the prod bucket runs every 4 hours
     _schedule_job(
-        path="/publish",
+        path="/deferred/publish",
         # Offset by 30 minutes to let other hourly tasks finish
         schedule="30 */4 * * *",
     )
 
     # Converting the outputs to JSON is less critical but also slow so it's run separately
     _schedule_job(
-        path="/convert_json_1",
+        path="/deferred/convert_json_1",
         # Offset by 30 minutes to run after publishing
         schedule="0 1-23/4 * * *",
     )
 
     # The convert to JSON task is split in two because otherwise it takes too long
     _schedule_job(
-        path="/convert_json_2",
+        path="/deferred/convert_json_2",
         # Offset by 30 minutes to run after publishing
         schedule="0 1-23/4 * * *",
     )
@@ -116,7 +116,7 @@ def schedule_all_jobs(project_id: str, location_id: str, time_zone: str) -> None
     for data_pipeline in get_pipelines():
         # The job that combines data sources into a table runs hourly
         _schedule_job(
-            path=f"/combine_table?table={data_pipeline.table}",
+            path=f"/deferred/combine_table?table={data_pipeline.table}",
             # Offset by 15 minutes to let other hourly tasks finish
             schedule="15 * * * *",
         )

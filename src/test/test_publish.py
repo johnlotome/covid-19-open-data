@@ -16,14 +16,16 @@ import sys
 from pathlib import Path
 from unittest import main
 from tempfile import TemporaryDirectory
-from typing import List
+from typing import Callable, List
 
 from pandas import DataFrame
-from lib.constants import SRC, EXCLUDE_FROM_MAIN_TABLE
+from lib.constants import SRC, OUTPUT_COLUMN_ADAPTER
 from lib.io import read_table, read_lines
 from lib.pipeline_tools import get_pipelines, get_schema
+
 from .profiled_test_case import ProfiledTestCase
-from publish import make_main_table, copy_tables, convert_tables_to_json
+from publish import convert_tables_to_json, publish_global_tables
+from publish import make_main_table_sqlite, make_main_table_v3
 
 # Make the main schema a global variable so we don't have to reload it in every test
 SCHEMA = get_schema()
@@ -42,27 +44,29 @@ class TestPublish(ProfiledTestCase):
         # Less than half of the rows have null values in any column after the first date
         self.assertGreaterEqual(len(subset.dropna()), len(subset) / 2)
 
-    def test_make_main_table(self):
+    def _test_make_main_table(self, make_main_table_func: Callable, location_key: str):
         with TemporaryDirectory() as workdir:
             workdir = Path(workdir)
 
             # Copy all test tables into the temporary directory
-            copy_tables(SRC / "test" / "data", workdir)
+            publish_global_tables(SRC / "test" / "data", workdir)
 
             # Create the main table
             main_table_path = workdir / "main.csv"
-            make_main_table(workdir, main_table_path)
+            make_main_table_func(
+                workdir, main_table_path, location_key=location_key, exclude_tables=["main"]
+            )
             main_table = read_table(main_table_path, schema=SCHEMA)
 
             # Verify that all columns from all tables exist
             for pipeline in get_pipelines():
-                if pipeline.table in EXCLUDE_FROM_MAIN_TABLE:
-                    continue
                 for column_name in pipeline.schema.keys():
-                    self.assertTrue(
-                        column_name in main_table.columns,
-                        f"Column {column_name} missing from main table",
-                    )
+                    column_name = OUTPUT_COLUMN_ADAPTER.get(column_name)
+                    if column_name is not None:
+                        self.assertTrue(
+                            column_name in main_table.columns,
+                            f"Column {column_name} missing from main table",
+                        )
 
             # Main table should follow a lexical sort (outside of header)
             main_table_records = []
@@ -72,11 +76,16 @@ class TestPublish(ProfiledTestCase):
             self.assertListEqual(main_table_records, list(sorted(main_table_records)))
 
             # Make the main table easier to deal with since we optimize for memory usage
-            main_table.set_index("key", inplace=True)
+            main_table.set_index(location_key, inplace=True)
             main_table["date"] = main_table["date"].astype(str)
 
             # Define sets of columns to check
-            epi_basic = ["new_confirmed", "total_confirmed", "new_deceased", "total_deceased"]
+            epi_basic = [
+                "new_confirmed",
+                "cumulative_confirmed",
+                "new_deceased",
+                "cumulative_deceased",
+            ]
 
             # Spot check: Country of Andorra
             self._spot_check_subset(main_table, "AD", epi_basic, "2020-03-02", "2020-09-01")
@@ -89,17 +98,21 @@ class TestPublish(ProfiledTestCase):
                 main_table, "US_FL_12001", epi_basic, "2020-03-10", "2020-09-01"
             )
 
+    def test_make_main_table(self):
+        self._test_make_main_table(make_main_table_v3, "location_key")
+        self._test_make_main_table(make_main_table_sqlite, "location_key")
+
     def test_convert_to_json(self):
         with TemporaryDirectory() as workdir:
             workdir = Path(workdir)
 
             # Copy all test tables into the temporary directory
-            copy_tables(SRC / "test" / "data", workdir)
+            publish_global_tables(SRC / "test" / "data", workdir)
 
             # Copy test tables again but under a subpath
             subpath = workdir / "latest"
             subpath.mkdir()
-            copy_tables(workdir, subpath)
+            publish_global_tables(workdir, subpath)
 
             # Convert all the tables to JSON under a new path
             jsonpath = workdir / "json"
