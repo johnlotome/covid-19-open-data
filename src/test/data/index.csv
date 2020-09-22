@@ -1,4 +1,4 @@
-key,wikidata,datacommons,country_code,country_name,subregion1_code,subregion1_name,subregion2_code,subregion2_name,3166-1-alpha-2,3166-1-alpha-3,aggregation_level
+key,wikidata,datacommons,country_code,country_name,subregion1_code,subregion1_name,subregion2_code,subregion2_name,iso_3166_1_alpha_2,iso_3166_1_alpha_3,aggregation_level
 AD,Q228,country/AND,AD,Andorra,,,,,AD,AND,0
 CZ,Q213,country/CZE,CZ,Czech Republic,,,,,CZ,CZE,0
 CZ_10,Q1085,nuts/CZ010,CZ,Czech Republic,10,Prague,,,CZ,CZE,1

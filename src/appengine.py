@@ -37,7 +37,15 @@ from google.oauth2.credentials import Credentials
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # pylint: disable=wrong-import-position
-from publish import copy_tables, convert_tables_to_json, create_table_subsets, make_main_table
+from publish import (
+    copy_tables,
+    convert_tables_to_json,
+    create_table_subsets,
+    make_main_table,
+    publish_global_tables,
+    publish_location_breakouts,
+    publish_location_aggregates,
+)
 from scripts.cloud_error_processing import register_new_errors
 
 from lib.concurrent import thread_map
@@ -45,6 +53,7 @@ from lib.constants import GCS_BUCKET_PROD, GCS_BUCKET_TEST, SRC
 from lib.error_logger import ErrorLogger
 from lib.gcloud import delete_instance, get_internal_ip, start_instance
 from lib.io import export_csv
+from lib.memory_efficient import table_read_column
 from lib.net import download
 from lib.pipeline import DataPipeline
 from lib.pipeline_tools import get_table_names
@@ -391,7 +400,80 @@ def publish_subset_tables() -> Response:
     return Response("OK", status=200)
 
 
-def _convert_json(expr: str = r"*.csv") -> Response:
+@app.route("/publish_v3_global_tables")
+def publish_v3_global_tables() -> Response:
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        tables_folder = workdir / "tables"
+        public_folder = workdir / "public"
+        tables_folder.mkdir(parents=True, exist_ok=True)
+        public_folder.mkdir(parents=True, exist_ok=True)
+
+        # Download all the combined tables into our local storage
+        download_folder(GCS_BUCKET_TEST, "tables", tables_folder)
+
+        # Publish the tables containing all location keys
+        publish_global_tables(tables_folder, public_folder)
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
+
+    return Response("OK", status=200)
+
+
+@app.route("/publish_v3_location_breakouts")
+def publish_v3_location_breakouts() -> Response:
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        tables_folder = workdir / "tables"
+        public_folder = workdir / "public"
+        tables_folder.mkdir(parents=True, exist_ok=True)
+        public_folder.mkdir(parents=True, exist_ok=True)
+
+        # Download all the combined tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", tables_folder)
+
+        # Break out each table into separate folders based on the location key
+        publish_location_breakouts(tables_folder, public_folder)
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
+
+    return Response("OK", status=200)
+
+
+@app.route("/publish_v3_location_aggregates")
+def publish_v3_location_aggregates(
+    location_key_from: str = None, location_key_until: str = None
+) -> Response:
+    location_key_from = _get_request_param("location_key_from", location_key_from)
+    location_key_until = _get_request_param("location_key_until", location_key_until)
+
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        tables_folder = workdir / "tables"
+        public_folder = workdir / "public"
+        tables_folder.mkdir(parents=True, exist_ok=True)
+        public_folder.mkdir(parents=True, exist_ok=True)
+
+        # Download all the location-dependent tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", tables_folder)
+
+        # Aggregate the tables for each location independently
+        location_keys = table_read_column(tables_folder / "index.csv", "location_key")
+        if location_key_from is not None:
+            location_keys = [key for key in location_keys if key >= location_key_from]
+        if location_key_until is not None:
+            location_keys = [key for key in location_keys if key <= location_key_until]
+        publish_location_aggregates(tables_folder, public_folder, location_keys)
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
+
+    return Response("OK", status=200)
+
+
+def _convert_json(expr: str) -> str:
     with TemporaryDirectory() as workdir:
         workdir = Path(workdir)
         json_folder = workdir / "json"
@@ -502,6 +584,11 @@ def main() -> None:
         publish_main_table()
         publish_subset_tables()
 
+    def _publish_v3():
+        publish_v3_global_tables()
+        publish_v3_location_breakouts()
+        publish_v3_location_aggregates()
+
     def _unknown_command(*func_args):
         logger.log_error(f"Unknown command {args.command}")
 
@@ -512,6 +599,7 @@ def main() -> None:
         "combine_table": combine_table,
         "cache_pull": cache_pull,
         "publish": _publish,
+        "publish_v3": _publish,
         "convert_json": _convert_json,
         "report_errors_to_github": report_errors_to_github,
     }.get(args.command, _unknown_command)(**json.loads(args.args or "{}"))

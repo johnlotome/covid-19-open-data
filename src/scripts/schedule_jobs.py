@@ -131,7 +131,7 @@ def schedule_all_jobs(project_id: str, location_id: str, time_zone: str) -> None
     for data_pipeline in get_pipelines():
         # The job that combines data sources into a table runs hourly
         _schedule_job(
-            path=f"/combine_table?table={data_pipeline.table}",
+            path=f"/deferred/combine_table?table={data_pipeline.table}",
             # Offset by 15 minutes to let other hourly tasks finish
             schedule="15 * * * *",
         )
