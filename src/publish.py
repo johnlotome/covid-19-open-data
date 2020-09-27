@@ -402,9 +402,11 @@ def publish_location_aggregates(
         location_keys: List of location keys to do aggregation for.
     """
     # Create a main.csv file for each of the locations in parallel
-    map_func = lambda key: make_main_table_v3(
-        tables_folder / key, output_folder / key / "main.csv", drop_empty_columns=True
-    )
+    def map_func(key: str):
+        key_output_file = output_folder / key / "main.csv"
+        key_output_file.parent.mkdir(parents=True, exist_ok=True)
+        make_main_table_v3(tables_folder / key, key_output_file, drop_empty_columns=True)
+
     list(thread_map(map_func, list(location_keys), desc="Creating location subsets"))
 
 
