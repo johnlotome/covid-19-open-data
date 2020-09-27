@@ -132,7 +132,7 @@ def download_folder(
 
     map_func = partial(_download_blob, local_folder)
     map_iter = bucket.list_blobs(prefix=remote_path)
-    list(thread_map(map_func, map_iter, total=None, disable=True, max_workers=8))
+    list(thread_map(map_func, map_iter, total=None, disable=True))
 
 
 def upload_folder(
@@ -456,19 +456,66 @@ def publish_v3_location_aggregates(
         tables_folder.mkdir(parents=True, exist_ok=True)
         public_folder.mkdir(parents=True, exist_ok=True)
 
-        # Download all the location-dependent tables into our local storage
-        download_folder(GCS_BUCKET_PROD, "v3", tables_folder)
-
-        # Aggregate the tables for each location independently
         location_keys = table_read_column(tables_folder / "index.csv", "location_key")
         if location_key_from is not None:
             location_keys = [key for key in location_keys if key >= location_key_from]
         if location_key_until is not None:
             location_keys = [key for key in location_keys if key <= location_key_until]
+
+        # Download all the processed tables into our local storage
+        def match_path(table_path: Path) -> bool:
+            try:
+                return str(table_path).split("/", 1)[0] in location_keys
+            except:
+                return False
+
+        # Download all the location-dependent tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", tables_folder, match_path)
+
+        # Aggregate the tables for each location independently
         publish_location_aggregates(tables_folder, public_folder, location_keys)
 
         # Upload the results to the prod bucket
         upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
+
+    return Response("OK", status=200)
+
+
+@app.route("/convert_json_v3")
+def convert_json_v3(location_key_from: str = None, location_key_until: str = None) -> Response:
+    location_key_from = _get_request_param("location_key_from", location_key_from)
+    location_key_until = _get_request_param("location_key_until", location_key_until)
+
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        input_folder = workdir / "input"
+        output_folder = workdir / "output"
+        input_folder.mkdir(parents=True, exist_ok=True)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Convert the tables to JSON for each location independently
+        location_keys = table_read_column(SRC / "data" / "metadata.csv", "key")
+        if location_key_from is not None:
+            location_keys = [key for key in location_keys if key >= location_key_from]
+        if location_key_until is not None:
+            location_keys = [key for key in location_keys if key <= location_key_until]
+
+        # Download all the processed tables into our local storage
+        def match_path(table_path: Path) -> bool:
+            try:
+                location_key, table_name = str(table_path).split("/", 1)
+                return table_name == "main.csv" and location_key in location_keys
+            except:
+                return False
+
+        download_folder(GCS_BUCKET_PROD, "v3", input_folder, match_path)
+
+        # Convert all files to JSON
+        list(convert_tables_to_json(input_folder, output_folder))
+        print("CSV files converted to JSON")
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", output_folder)
 
     return Response("OK", status=200)
 
@@ -599,8 +646,9 @@ def main() -> None:
         "combine_table": combine_table,
         "cache_pull": cache_pull,
         "publish": _publish,
-        "publish_v3": _publish,
+        "publish_v3": _publish_v3,
         "convert_json": _convert_json,
+        "convert_json_v3": convert_json_v3,
         "report_errors_to_github": report_errors_to_github,
     }.get(args.command, _unknown_command)(**json.loads(args.args or "{}"))
 

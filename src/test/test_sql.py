@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sqlite3
 import sys
 from pathlib import Path
 from unittest import main
@@ -28,13 +27,13 @@ from lib.sql import (
     table_create,
     table_import_from_file,
     table_import_from_records,
-    table_join,
     table_select_all,
 )
 from lib.pipeline_tools import get_schema
 
-from lib.sql import table_merge as table_join
-from lib.utils import table_merge as table_join
+from lib.sql import table_join as table_join_sql
+from lib.sql import table_merge as table_merge_sql
+from lib.utils import table_merge as table_merge_pandas
 
 from .profiled_test_case import ProfiledTestCase
 
@@ -130,13 +129,15 @@ class TestSql(ProfiledTestCase):
 
                 # Merge and output as an iterable
                 result1 = DataFrame.from_records(
-                    table_join(conn, table_name_left, table_name_right, on=["col1"], how=how_sqlite)
+                    table_join_sql(
+                        conn, table_name_left, table_name_right, on=["col1"], how=how_sqlite
+                    )
                 )
                 self._compare_dataframes_equal(result1, expected)
 
                 # Merge into a table, and output its data
                 table_name_merged = "_merged"
-                table_join(
+                table_join_sql(
                     conn,
                     table_name_left,
                     table_name_right,
@@ -200,13 +201,13 @@ class TestSql(ProfiledTestCase):
                 self._check_table_not_empty(conn, table_name_2)
                 self._check_table_not_empty(conn, table_name_3)
 
-                expected = table_join(
+                expected = table_merge_pandas(
                     [test_data_1, test_data_2, test_data_3], on=["col1"], how=how_pandas
                 )
 
                 # Merge and output as an iterable
                 result1 = DataFrame.from_records(
-                    table_join(
+                    table_merge_sql(
                         conn,
                         [table_name_1, table_name_2, table_name_3],
                         on=["col1"],
@@ -217,7 +218,7 @@ class TestSql(ProfiledTestCase):
 
                 # Merge into a table, and output its data
                 table_name_merged = "_merged"
-                table_join(
+                table_merge_sql(
                     conn,
                     [table_name_1, table_name_2, table_name_3],
                     on=["col1"],
