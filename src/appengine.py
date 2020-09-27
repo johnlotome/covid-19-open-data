@@ -132,7 +132,7 @@ def download_folder(
 
     map_func = partial(_download_blob, local_folder)
     map_iter = bucket.list_blobs(prefix=remote_path)
-    list(thread_map(map_func, map_iter, total=None, disable=True))
+    list(thread_map(map_func, map_iter, total=None, disable=True, max_workers=8))
 
 
 def upload_folder(
@@ -421,29 +421,8 @@ def publish_v3_global_tables() -> Response:
     return Response("OK", status=200)
 
 
-@app.route("/publish_v3_location_breakouts")
-def publish_v3_location_breakouts() -> Response:
-    with TemporaryDirectory() as workdir:
-        workdir = Path(workdir)
-        tables_folder = workdir / "tables"
-        public_folder = workdir / "public"
-        tables_folder.mkdir(parents=True, exist_ok=True)
-        public_folder.mkdir(parents=True, exist_ok=True)
-
-        # Download all the combined tables into our local storage
-        download_folder(GCS_BUCKET_PROD, "v3", tables_folder)
-
-        # Break out each table into separate folders based on the location key
-        publish_location_breakouts(tables_folder, public_folder)
-
-        # Upload the results to the prod bucket
-        upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
-
-    return Response("OK", status=200)
-
-
-@app.route("/publish_v3_location_aggregates")
-def publish_v3_location_aggregates(
+@app.route("/publish_v3_location_subsets")
+def publish_v3_location_subsets(
     location_key_from: str = None, location_key_until: str = None
 ) -> Response:
     location_key_from = _get_request_param("location_key_from", location_key_from)
@@ -451,32 +430,29 @@ def publish_v3_location_aggregates(
 
     with TemporaryDirectory() as workdir:
         workdir = Path(workdir)
-        tables_folder = workdir / "tables"
-        public_folder = workdir / "public"
-        tables_folder.mkdir(parents=True, exist_ok=True)
-        public_folder.mkdir(parents=True, exist_ok=True)
+        input_folder = workdir / "input"
+        intermediate_folder = workdir / "temp"
+        output_folder = workdir / "output"
+        input_folder.mkdir(parents=True, exist_ok=True)
+        output_folder.mkdir(parents=True, exist_ok=True)
 
-        location_keys = table_read_column(tables_folder / "index.csv", "location_key")
+        location_keys = table_read_column(SRC / "data" / "metadata.csv", "key")
         if location_key_from is not None:
             location_keys = [key for key in location_keys if key >= location_key_from]
         if location_key_until is not None:
             location_keys = [key for key in location_keys if key <= location_key_until]
 
-        # Download all the processed tables into our local storage
-        def match_path(table_path: Path) -> bool:
-            try:
-                return str(table_path).split("/", 1)[0] in location_keys
-            except:
-                return False
+        # Download all the global tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", input_folder, lambda x: "/" not in str(x))
 
-        # Download all the location-dependent tables into our local storage
-        download_folder(GCS_BUCKET_PROD, "v3", tables_folder, match_path)
+        # Break out each table into separate folders based on the location key
+        publish_location_breakouts(input_folder, intermediate_folder)
 
         # Aggregate the tables for each location independently
-        publish_location_aggregates(tables_folder, public_folder, location_keys)
+        publish_location_aggregates(intermediate_folder, output_folder, location_keys)
 
         # Upload the results to the prod bucket
-        upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
+        upload_folder(GCS_BUCKET_PROD, "v3", output_folder)
 
     return Response("OK", status=200)
 
@@ -633,8 +609,7 @@ def main() -> None:
 
     def _publish_v3():
         publish_v3_global_tables()
-        publish_v3_location_breakouts()
-        publish_v3_location_aggregates()
+        publish_v3_location_subsets()
 
     def _unknown_command(*func_args):
         logger.log_error(f"Unknown command {args.command}")

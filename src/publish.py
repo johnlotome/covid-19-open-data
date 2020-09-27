@@ -16,7 +16,6 @@
 import cProfile
 import datetime
 import shutil
-import sys
 import traceback
 from argparse import ArgumentParser
 from functools import partial
