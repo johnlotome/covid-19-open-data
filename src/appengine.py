@@ -415,6 +415,7 @@ def publish_v3_global_tables() -> Response:
 
         # Publish the tables containing all location keys
         publish_global_tables(tables_folder, public_folder)
+        logger.log_info("Global tables created")
 
         # Upload the results to the prod bucket
         upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
@@ -442,6 +443,10 @@ def publish_v3_location_subsets(
             location_keys = [key for key in location_keys if key >= location_key_from]
         if location_key_until is not None:
             location_keys = [key for key in location_keys if key <= location_key_until]
+        logger.log_info(
+            f"Publishing {len(location_keys)} location subsets "
+            f"from {location_keys[0]} until {location_keys[-1]}"
+        )
 
         # Download all the global tables into our local storage
         download_folder(GCS_BUCKET_PROD, "v3", input_folder, lambda x: "/" not in str(x))
@@ -498,6 +503,10 @@ def publish_v3_json(location_key_from: str = None, location_key_until: str = Non
             location_keys = [key for key in location_keys if key >= location_key_from]
         if location_key_until is not None:
             location_keys = [key for key in location_keys if key <= location_key_until]
+        logger.log_info(
+            f"Converting {len(location_keys)} location subsets to JSON "
+            f"from {location_keys[0]} until {location_keys[-1]}"
+        )
 
         # Download all the processed tables into our local storage
         def match_path(table_path: Path) -> bool:
