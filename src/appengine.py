@@ -42,6 +42,7 @@ from publish import (
     convert_tables_to_json,
     create_table_subsets,
     make_main_table,
+    make_main_table_sqlite,
     publish_global_tables,
     publish_location_breakouts,
     publish_location_aggregates,
@@ -457,8 +458,30 @@ def publish_v3_location_subsets(
     return Response("OK", status=200)
 
 
-@app.route("/convert_json_v3")
-def convert_json_v3(location_key_from: str = None, location_key_until: str = None) -> Response:
+@app.route("/publish_v3_sqlite")
+def publish_v3_sqlite() -> Response:
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        input_folder = workdir / "input"
+        output_folder = workdir / "output"
+        input_folder.mkdir(parents=True, exist_ok=True)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Download all the global tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", input_folder, lambda x: "/" not in str(x))
+
+        # Publish the SQLite file containing all data
+        sqlite_path = output_folder / "covid-19-open-data.sqlite"
+        make_main_table_sqlite(input_folder, sqlite_path, logger=logger)
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", output_folder)
+
+    return Response("OK", status=200)
+
+
+@app.route("/publish_v3_json")
+def publish_v3_json(location_key_from: str = None, location_key_until: str = None) -> Response:
     location_key_from = _get_request_param("location_key_from", location_key_from)
     location_key_until = _get_request_param("location_key_until", location_key_until)
 
@@ -623,7 +646,7 @@ def main() -> None:
         "publish": _publish,
         "publish_v3": _publish_v3,
         "convert_json": _convert_json,
-        "convert_json_v3": convert_json_v3,
+        "convert_json_v3": publish_v3_json,
         "report_errors_to_github": report_errors_to_github,
     }.get(args.command, _unknown_command)(**json.loads(args.args or "{}"))
 

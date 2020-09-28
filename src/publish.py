@@ -448,7 +448,11 @@ def main_v3(output_folder: Path, tables_folder: Path, show_progress: bool = True
         publish_location_aggregates(v3_folder, v3_folder, location_keys)
 
         # Convert all CSV files to JSON using values format
-        # convert_tables_to_json([*v3_folder.glob("**/*.csv")], v3_folder)
+        global_tables = list(v3_folder.glob("*.csv"))
+        location_tables = [
+            table for table in v3_folder.glob("**/*.csv") if table not in global_tables
+        ]
+        convert_tables_to_json(location_tables, v3_folder)
 
 
 def main_v2(output_folder: Path, tables_folder: Path, show_progress: bool = True) -> None:
