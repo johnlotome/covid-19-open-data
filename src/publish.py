@@ -43,7 +43,7 @@ from lib.memory_efficient import (
     table_sort,
 )
 from lib.pipeline_tools import get_schema
-from lib.sql import create_sqlite_database, table_as_csv, table_import_from_file, table_merge
+from lib.sql import create_sqlite_database, table_import_from_file
 from lib.time import date_range
 
 
@@ -219,7 +219,12 @@ def make_main_table_v3(
         _make_location_key_and_date_table(tables_folder, temp_output)
         temp_input, temp_output = temp_output, temp_input
 
-        for table_file_path in tables_folder.glob("*.csv"):
+        # List of tables excludes main.csv and non-daily data sources
+        exclude_tables = ("main", "search-trends-weekly")
+        table_iter = sorted(tables_folder.glob("*.csv"))
+        table_paths = [table for table in table_iter if table.stem not in exclude_tables]
+
+        for table_file_path in table_paths:
             table_name = table_file_path.stem
 
             # Procede depending on whether this table should be excluded
@@ -251,82 +256,45 @@ def make_main_table_v3(
 
 
 def make_main_table_sqlite(
-    tables_folder: Path, output_path: Path, drop_empty_columns: bool = False
+    tables_folder: Path,
+    output_path: Path,
+    drop_empty_columns: bool = False,
+    logger: ErrorLogger = ErrorLogger(),
 ) -> None:
     """
     Build a flat view of all tables combined, joined by <key> or <key, date>.
 
     Arguments:
         tables_folder: Input directory where all CSV files exist.
-        output_path: Output directory for the resulting main.csv file.
-        location_key: Name of the key to use for the location, "key" (v2) or "location_key" (v3).
-        exclude_tables: List of tables that should be excluded from the joint output.
+        output_path: Output path for the resulting SQLite file.
         drop_empty_columns: Flag indicating whether columns with no data should be dropped.
     """
     # Use a temporary directory for intermediate files
     with TemporaryDirectory() as workdir:
         workdir = Path(workdir)
 
-        # Start with all combinations of <key x date>
-        cross_product_table_path = workdir / "cross-product.csv"
-        _make_location_key_and_date_table(tables_folder, cross_product_table_path)
+        # Import all tables into a database on disk at the provided path
+        with create_sqlite_database(output_path) as conn:
 
-        # Import all tables into a temporary database, default to using in-memory db
-        with create_sqlite_database() as conn:
-
-            cross_product_schema = {"location_key": str, "date": str}
-            table_import_from_file(conn, cross_product_table_path, schema=cross_product_schema)
+            # List of tables excludes main.csv and non-daily data sources
+            exclude_tables = ("main", "search-trends-weekly")
+            table_iter = sorted(tables_folder.glob("*.csv"))
+            table_paths = [table for table in table_iter if table.stem not in exclude_tables]
 
             # Get a list of all tables indexed by <location_key> or by <location_key, date>
             schema = get_schema()
-            idx1 = []
-            idx2 = [cross_product_table_path.stem]
-            for table_file_path in tables_folder.glob("*.csv"):
+            for table_file_path in table_paths:
                 table_name = table_file_path.stem
                 table_columns = get_table_columns(table_file_path)
                 table_schema = {col: schema.get(col, str) for col in table_columns}
                 table_import_from_file(
                     conn, table_file_path, table_name=table_name, schema=table_schema
                 )
-                if "date" in table_columns:
-                    idx2.append(table_name)
-                else:
-                    idx1.append(table_name)
-
-            # More readable variable name
-            key = "location_key"
-
-            # All joins are LEFT OUTER JOIN
-            join_method = "LEFT OUTER"
-
-            # Perform the join in 3 steps, first join all tables by key
-            table_merge(conn, idx1, on=[key], how=join_method, into_table="_idx1")
-
-            # Next, join all the tables by <key, date>
-            table_merge(conn, idx2, on=[key, "date"], how=join_method, into_table="_idx2")
-
-            # Finally join the two sets of tables together
-            # NOTE: order of tables merged matters, since SQLite only supports *LEFT* OUTER joins
-            table_merge(conn, ["_idx2", "_idx1"], on=[key], how=join_method, into_table="_main")
-
-            # TODO: avoid use of temporary files for this
-            temp_input = workdir / "tmp.1.csv"
-            temp_output = workdir / "tmp.2.csv"
-
-            # Dump the table as a CSV file
-            table_as_csv(conn, "_main", temp_output, sort_by=[key, "date"])
-            temp_input, temp_output = temp_output, temp_input
-
-            # Drop rows with null date or without a single dated record
-            # TODO: figure out a memory-efficient way to do this
 
             # Remove columns which provide no data because they are only null values
             if drop_empty_columns:
-                table_drop_nan_columns(temp_input, temp_output)
-                temp_input, temp_output = temp_output, temp_input
-
-            # Write to output location
-            shutil.copy(temp_input, output_path)
+                # TODO: implement this in SQL module
+                pass
 
 
 def create_table_subsets(main_table_path: Path, output_path: Path) -> Iterable[Path]:
@@ -374,7 +342,9 @@ def convert_tables_to_json(
             yield json_output
 
 
-def publish_location_breakouts(tables_folder: Path, output_folder: Path) -> None:
+def publish_location_breakouts(
+    tables_folder: Path, output_folder: Path, logger: ErrorLogger = ErrorLogger()
+) -> None:
     """
     Breaks out each of the tables in `tables_folder` based on location key, and writes them into
     subdirectories of `output_folder`. This method also joins *all* the tables into a main.csv
@@ -386,7 +356,7 @@ def publish_location_breakouts(tables_folder: Path, output_folder: Path) -> None
     """
     # Break out each table into separate folders based on the location key
     for csv_path in tables_folder.glob("*.csv"):
-        print(f"Breaking out table {csv_path.name}")
+        logger.log_info(f"Breaking out table {csv_path.name}")
         table_breakout(csv_path, output_folder, "location_key")
 
 
@@ -410,7 +380,9 @@ def publish_location_aggregates(
     list(thread_map(map_func, list(location_keys), desc="Creating location subsets"))
 
 
-def publish_global_tables(tables_folder: Path, output_folder: Path) -> None:
+def publish_global_tables(
+    tables_folder: Path, output_folder: Path, logger: ErrorLogger = ErrorLogger()
+) -> None:
     """
     Copy all the tables from `tables_folder` into `output_folder` converting the column names to the
     latest schema, and join all the tables into a single main.csv file.
@@ -424,12 +396,12 @@ def publish_global_tables(tables_folder: Path, output_folder: Path) -> None:
 
         for csv_path in tables_folder.glob("*.csv"):
             # Copy all output files to a temporary folder, renaming columns if necessary
-            print(f"Renaming columns for {csv_path.name}")
+            logger.log_info(f"Renaming columns for {csv_path.name}")
             table_rename(csv_path, workdir / csv_path.name, OUTPUT_COLUMN_ADAPTER)
 
         for csv_path in tables_folder.glob("*.csv"):
             # Sort output files by location key, since the following breakout step requires it
-            print(f"Sorting {csv_path.name}")
+            logger.log_info(f"Sorting {csv_path.name}")
             table_sort(workdir / csv_path.name, output_folder / csv_path.name, ["location_key"])
 
     # Main table is not created for the global output, because it's too big to be useful
@@ -464,6 +436,9 @@ def main_v3(output_folder: Path, tables_folder: Path, show_progress: bool = True
 
         # Publish the tables containing all location keys
         publish_global_tables(tables_folder, v3_folder)
+
+        # Create the SQLite file containing all tables together
+        make_main_table_sqlite(v3_folder, v3_folder / "covid-19-open-data.sqlite")
 
         # Break out each table into separate folders based on the location key
         publish_location_breakouts(v3_folder, v3_folder)

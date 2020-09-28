@@ -48,6 +48,8 @@ def _dtype_to_sql_type(dtype: Any) -> str:
 def _safe_column_name(column_name: str) -> str:
     if "." in column_name:
         column_name = f"[{column_name}]"
+    if "-" in column_name:
+        column_name = column_name.replace("-", "_")
     if column_name in ("on", "left", "right", "index"):
         column_name = f"_{column_name}"
     return column_name
